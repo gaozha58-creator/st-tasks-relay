@@ -1,0 +1,57 @@
+#st_tasks_relay_settings .inline-drawer-content {
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+#st_tasks_relay_settings input[type="text"],
+#st_tasks_relay_settings input[type="password"] {
+    width: 100%;
+}
+
+#st_tasks_relay_settings .relay-status-bar {
+    font-size: 0.88em;
+    padding: 5px 8px;
+    border-radius: 6px;
+    background: rgba(128, 128, 128, 0.14);
+    color: var(--SmartThemeBodyColor, #ddd);
+    word-break: break-all;
+}
+
+#st_tasks_relay_settings .relay-key-label {
+    color: #eaa61e;
+    font-size: 1.02em;
+    margin-bottom: -4px;
+}
+
+#st_tasks_relay_settings .relay-key-input {
+    border: 1px solid #eaa61e !important;
+    box-shadow: 0 0 6px rgba(234, 166, 30, 0.35);
+}
+
+#st_tasks_relay_settings .relay-key-input:not(.has-key) {
+    animation: relay-breathe 2.5s ease-in-out infinite;
+}
+
+@keyframes relay-breathe {
+    0%, 100% { box-shadow: 0 0 4px rgba(234, 166, 30, 0.25); }
+    50% { box-shadow: 0 0 10px rgba(234, 166, 30, 0.6); }
+}
+
+#st_tasks_relay_settings .relay-key-input.has-key {
+    animation: none;
+    border-color: #4caf50 !important;
+    box-shadow: none;
+}
+
+#st_tasks_relay_settings .relay-actions {
+    gap: 8px;
+    margin-top: 2px;
+}
+
+#st_tasks_relay_settings .relay-hint {
+    font-size: 0.85em;
+    opacity: 0.78;
+    line-height: 1.45;
+}

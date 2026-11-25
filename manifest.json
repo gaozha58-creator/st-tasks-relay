@@ -1,0 +1,13 @@
+{
+    "display_name": "ST Tasks Relay (断网续传)",
+    "loading_order": 10,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "optimized-from-st-catiecli-tasks",
+    "version": "2.0.0",
+    "hooks": {
+        "activate": "init"
+    }
+}

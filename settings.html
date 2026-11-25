@@ -1,0 +1,63 @@
+<div id="st_tasks_relay_settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>ST Tasks Relay (断网续传)</b>
+            <label class="checkbox_label" title="一键切换是否接管生成请求">
+                <input id="st_tasks_relay_enabled" type="checkbox">
+                <span>接管</span>
+            </label>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <div class="flex-container flexFlowColumn">
+                <div class="relay-status-bar">
+                    <span id="st_tasks_relay_status">待机</span>
+                </div>
+
+                <span class="flex-basis100 relay-key-label">
+                    <i class="fa-solid fa-key"></i> <b>API 密钥</b>（填你的 sk- 令牌，填后保存）:
+                </span>
+                <div class="flex-container">
+                    <input id="st_tasks_relay_key" type="password" class="text_pole flex1 relay-key-input" placeholder="sk-xxxxxxxx" autocomplete="off">
+                    <i id="st_tasks_relay_key_toggle" class="menu_button fa-solid fa-eye" title="显示/隐藏密钥"></i>
+                    <i id="st_tasks_relay_key_save" class="menu_button fa-solid fa-save" title="保存密钥"></i>
+                </div>
+
+                <span class="flex-basis100">
+                    <i class="fa-solid fa-server"></i> <b>任务网关地址</b>（留空默认 https://relay.20261121.icu）:
+                </span>
+                <div class="flex-container">
+                    <input id="st_tasks_relay_upstream" type="text" class="text_pole flex1" placeholder="https://relay.20261121.icu">
+                    <i id="st_tasks_relay_upstream_save" class="menu_button fa-solid fa-save" title="保存网关地址"></i>
+                </div>
+
+                <div class="flex-container relay-actions">
+                    <button id="st_tasks_relay_test" class="menu_button flex1" type="button">
+                        <i class="fa-solid fa-plug"></i> 测试连接
+                    </button>
+                    <button id="st_tasks_relay_recover" class="menu_button flex1" type="button">
+                        <i class="fa-solid fa-rotate-left"></i> 找回上次回复
+                    </button>
+                </div>
+
+                <details class="flex-basis100">
+                    <summary style="cursor:pointer;opacity:.8">高级选项（长轮询 / 断网容忍时间）</summary>
+                    <div class="flex-container flexFlowColumn" style="margin-top:8px;gap:6px">
+                        <label class="checkbox_label">
+                            <input id="st_tasks_relay_longpoll" type="checkbox">
+                            <span>启用长轮询（自建网关 0ms 秒推；兼容旧服务端自动降级）</span>
+                        </label>
+                        <div class="flex-container" style="align-items:center;gap:8px">
+                            <span>断网容忍上限（分钟）:</span>
+                            <input id="st_tasks_relay_grace_min" type="number" min="1" max="30" class="text_pole" style="width:72px">
+                        </div>
+                    </div>
+                </details>
+
+                <span class="flex-basis100 relay-hint">
+                    开启标题栏「接管」后，Custom 源生成改为「幂等提交 + 长轮询断点续传」，手机切后台/断网自动续拉；关闭「接管」立即恢复原生直连。
+                </span>
+            </div>
+        </div>
+    </div>
+</div>
