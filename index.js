@@ -1,16 +1,3 @@
-/**
- * ST Tasks Relay — SillyTavern 前端抗断网扩展 (v2.0.0)
- *
- * 基于 st-catiecli-tasks 深度重构，配合自建 OpenAI Tasks 异步中继网关（并向下兼容原版 catiecli）：
- *   1. 幂等提交（X-Idempotency-Key）：弱网重试绝不重复扣费
- *   2. 事件驱动长轮询（?after=N&wait=25000）：新分片 0ms 秒推，无新数据不空转；旧后端自动平滑降级
- *   3. 时间预算抗断网重连：默认容忍最长 10 分钟断网/切后台/换网；监听 online/visibilitychange 0ms 瞬时恢复；
- *      对网络异常及 408/429/502/503/504 网关闪断自动指数退避重试
- *   4. 修复原版 8 项 Bug：上游地址回显、非流式取消补发、已提交不再误回退直连防双倍扣费、
- *      黑名单参数透传（保留 thinking/reasoning/top_k/min_p）、Request 对象兼容、全程 [DONE]/error 追踪等
- *   5. 刷新/切后台被杀后「一键找回上次回复」：持久化 taskId，随时从服务端拉回已生成正文并复制
- */
-
 import { extension_settings, renderExtensionTemplateAsync, getContext } from '../../../extensions.js';
 import { saveSettings, saveSettingsDebounced } from '../../../../script.js';
 import { chat_completion_sources } from '../../../openai.js';
@@ -18,807 +5,420 @@ import { chat_completion_sources } from '../../../openai.js';
 const MODULE_NAME = 'st-tasks-relay';
 const GENERATE_URL = '/api/backends/chat-completions/generate';
 const DEFAULT_GATEWAY = 'https://relay.20261121.icu';
-const LAST_TASK_STORAGE_KEY = 'st_tasks_relay_last_task_v1';
+const LAST_TASK_KEY = 'st_tasks_relay_last_task_v1';
 
-// 轮询与容错常量
-const LONG_POLL_WAIT_MS = 25000;     // 长轮询服务端挂起时间
-const SUBMIT_TIMEOUT_MS = 30000;     // 单次提交超时
-const POLL_HTTP_OVERHEAD_MS = 15000; // 单次轮询在 wait 之外的额外网络超时缓冲
-const FALLBACK_IDLE_MS = 1500;       // 兼容旧服务端（不支持长轮询）时的空闲间隔
-const FALLBACK_BUSY_MS = 350;        // 兼容旧服务端时的有数据跟进间隔
-const POLL_MAX_MINUTES = 30;         // 单任务最长总等待时间
-const RETRY_BASE_MS = 1000;          // 退避基数
-const RETRY_MAX_DELAY_MS = 10000;    // 退避上限
+const LONG_POLL_WAIT_MS = 25000;
+const SUBMIT_TIMEOUT_MS = 30000;
+const POLL_OVERHEAD_MS = 15000;
+const FALLBACK_IDLE_MS = 1500;
+const FALLBACK_BUSY_MS = 350;
+const POLL_MAX_MIN = 30;
+const RETRY_BASE_MS = 1000;
+const RETRY_MAX_MS = 10000;
+const RETRY_STATUS = new Set([408, 429, 502, 503, 504, 520, 521, 522, 523, 524]);
 
-// 瞬时可重试 HTTP 状态码（代理闪断、CDN 超时、限流）
-const RETRYABLE_HTTP_STATUS = new Set([408, 429, 502, 503, 504, 520, 521, 522, 523, 524]);
-
-// ST 内部控制字段黑名单（并自动剥离各非 Custom 供应商专用前缀字段）
-const ST_INTERNAL_FIELDS = new Set([
-    'chat_completion_source',
-    'type',
-    'reverse_proxy',
-    'proxy_password',
-    'custom_url',
-    'custom_include_headers',
-    'custom_include_body',
-    'custom_exclude_body',
-    'custom_prompt_post_processing',
-    'group_names',
-    'use_sysprompt',
-    'show_thoughts',
-    'enable_web_search',
-    'request_images',
-    'image_inlining',
-    'function_calling',
-    'assistant_prefill',
-    'assistant_impersonation',
-    'max_context',
-    'api_key_custom',
-    'model_source',
-    'stream_openai',
-    'include_names',
-    'continue_prefill',
-    'continue_postfix',
+const ST_INTERNAL = new Set([
+    'chat_completion_source', 'type', 'reverse_proxy', 'proxy_password',
+    'custom_url', 'custom_include_headers', 'custom_include_body', 'custom_exclude_body',
+    'custom_prompt_post_processing', 'group_names', 'use_sysprompt', 'show_thoughts',
+    'enable_web_search', 'request_images', 'image_inlining', 'function_calling',
+    'assistant_prefill', 'assistant_impersonation', 'max_context', 'api_key_custom',
+    'model_source', 'stream_openai', 'include_names', 'continue_prefill', 'continue_postfix',
 ]);
-const ST_VENDOR_PREFIX_RE = /^(claude|vertexai|openrouter|mistral|cohere|google|makersuite|perplexity|xai|zai|ai21|groq|nanogpt|moonshot|chutes|electronhub|pollinations|aimlapi)_/i;
-
-/** 从当前模块 URL 动态解析模板目录，避免用户修改仓库名/目录名后 settings.html 404 */
-function resolveTemplateBase() {
-    try {
-        const m = new URL(import.meta.url).pathname.match(/\/scripts\/extensions\/(.+)\/[^/]+$/);
-        if (m && m[1]) return m[1];
-    } catch { /* ignore */ }
-    return `third-party/${MODULE_NAME}`;
-}
+const VENDOR_RE = /^(claude|vertexai|openrouter|mistral|cohere|google|makersuite|perplexity|xai|zai|ai21|groq|nanogpt|moonshot|chutes|electronhub|pollinations|aimlapi)_/i;
 
 const defaultSettings = {
-    enabled: false,
+    enabled: true,
+    onlyMainChat: true,
     apiKey: '',
     upstreamOverride: '',
     useLongPoll: true,
     offlineGraceMinutes: 10,
 };
 
-function getOaiSettings() {
-    return getContext()?.chatCompletionSettings ?? {};
+let quietActive = false;
+function bindGenEvents() {
+    try {
+        const ctx = getContext(), es = ctx?.eventSource, ev = ctx?.eventTypes || {};
+        if (!es || typeof es.on !== 'function') return;
+        es.on(ev.GENERATION_STARTED || 'generation_started', (type) => { quietActive = (type === 'quiet'); });
+        const clr = () => { quietActive = false; };
+        es.on(ev.GENERATION_ENDED || 'generation_ended', clr);
+        es.on(ev.GENERATION_STOPPED || 'generation_stopped', clr);
+    } catch {}
 }
 
+function resolveTemplateBase() {
+    try {
+        const m = new URL(import.meta.url).pathname.match(/\/scripts\/extensions\/(.+)\/[^/]+$/);
+        if (m?.[1]) return m[1];
+    } catch {}
+    return `third-party/${MODULE_NAME}`;
+}
+
+const getOai = () => getContext()?.chatCompletionSettings ?? {};
+const normUrl = (u) => String(u || '').trim().replace(/\/+$/, '').toLowerCase();
 function loadSettings() {
     extension_settings[MODULE_NAME] = extension_settings[MODULE_NAME] || {};
-    for (const key of Object.keys(defaultSettings)) {
-        if (extension_settings[MODULE_NAME][key] === undefined) {
-            extension_settings[MODULE_NAME][key] = defaultSettings[key];
-        }
+    for (const k of Object.keys(defaultSettings)) {
+        if (extension_settings[MODULE_NAME][k] === undefined) extension_settings[MODULE_NAME][k] = defaultSettings[k];
     }
 }
-
-function getSettings() {
-    return extension_settings[MODULE_NAME] ?? defaultSettings;
-}
-
-function setStatusText(text) {
-    const el = document.getElementById('st_tasks_relay_status');
-    if (el) el.textContent = text;
-}
-
-function uuid() {
-    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-        return crypto.randomUUID();
-    }
-    return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
-}
-
-// ==================== 地址与密钥解析 ====================
+const getSettings = () => extension_settings[MODULE_NAME] ?? defaultSettings;
+const setStatus = (t) => { const el = document.getElementById('st_tasks_relay_status'); if (el) el.textContent = t; };
+const uuid = () => (typeof crypto?.randomUUID === 'function' ? crypto.randomUUID() : 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12));
 
 function resolveUpstream() {
-    const s = getSettings();
-    if (s.upstreamOverride?.trim()) {
-        return s.upstreamOverride.trim().replace(/\/+$/, '').replace(/\/(v1|v1beta)$/i, '');
-    }
-    return DEFAULT_GATEWAY;
+    const u = getSettings().upstreamOverride?.trim();
+    return (u || DEFAULT_GATEWAY).replace(/\/+$/, '').replace(/\/(v1|v1beta)$/i, '');
 }
-
 function resolveApiKey() {
-    const key = getSettings().apiKey?.trim();
-    if (key) return key;
-    throw new Error('未设置 API 密钥：请在 ST Tasks Relay 扩展面板填写密钥并保存');
+    const k = getSettings().apiKey?.trim();
+    if (k) return k;
+    throw new Error('未设置 API 密钥：请在 ST Tasks Relay 面板填写 sk- 密钥并保存');
 }
+const saveLastTask = (info) => { try { localStorage.setItem(LAST_TASK_KEY, JSON.stringify(info)); } catch {} };
+const loadLastTask = () => { try { return JSON.parse(localStorage.getItem(LAST_TASK_KEY) || 'null'); } catch { return null; } };
 
-// ==================== 持久化最近任务（刷新/被杀找回） ====================
-
-function saveLastTask(info) {
-    try {
-        localStorage.setItem(LAST_TASK_STORAGE_KEY, JSON.stringify(info));
-    } catch { /* ignore quota */ }
-}
-
-function loadLastTask() {
-    try {
-        const raw = localStorage.getItem(LAST_TASK_STORAGE_KEY);
-        return raw ? JSON.parse(raw) : null;
-    } catch {
-        return null;
-    }
-}
-
-// ==================== 抗断网等待与重试引擎 ====================
-
-/** 可被用户停止、网络恢复、切回前台立即打断的 sleep */
-function smartSleep(ms, signal, wakeOnReconnect = false) {
+function smartSleep(ms, signal, wake = false) {
     if (ms <= 0) return Promise.resolve();
     return new Promise((resolve, reject) => {
-        if (signal?.aborted) {
-            reject(new DOMException('aborted', 'AbortError'));
-            return;
-        }
-        let settled = false;
-        const cleanup = () => {
-            clearTimeout(timer);
-            signal?.removeEventListener('abort', onAbort);
-            if (wakeOnReconnect) {
-                window.removeEventListener('online', onWake);
-                document.removeEventListener('visibilitychange', onVis);
-            }
+        if (signal?.aborted) return reject(new DOMException('aborted', 'AbortError'));
+        let done = false;
+        const clean = () => {
+            clearTimeout(tm);
+            signal?.removeEventListener('abort', onA);
+            if (wake) { window.removeEventListener('online', onW); document.removeEventListener('visibilitychange', onV); }
         };
-        const finish = () => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            resolve();
-        };
-        const onAbort = () => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            reject(new DOMException('aborted', 'AbortError'));
-        };
-        const onWake = () => finish();
-        const onVis = () => {
-            if (document.visibilityState === 'visible') finish();
-        };
-        const timer = setTimeout(finish, ms);
-        signal?.addEventListener('abort', onAbort, { once: true });
-        if (wakeOnReconnect) {
-            window.addEventListener('online', onWake, { once: true });
-            document.addEventListener('visibilitychange', onVis);
-        }
+        const fin = () => { if (!done) { done = true; clean(); resolve(); } };
+        const onA = () => { if (!done) { done = true; clean(); reject(new DOMException('aborted', 'AbortError')); } };
+        const onW = () => fin();
+        const onV = () => { if (document.visibilityState === 'visible') fin(); };
+        const tm = setTimeout(fin, ms);
+        signal?.addEventListener('abort', onA, { once: true });
+        if (wake) { window.addEventListener('online', onW, { once: true }); document.addEventListener('visibilitychange', onV); }
     });
 }
 
-/** 带独立超时的原生 fetch，不受自身 patch 影响 */
 const nativeFetch = window.fetch.bind(window);
-
-async function fetchWithTimeout(url, options, timeoutMs, outerSignal) {
+async function fetchTimeout(url, opts, ms, outerSig) {
     const ac = new AbortController();
     let timedOut = false;
-    const timer = setTimeout(() => {
-        timedOut = true;
-        try { ac.abort(); } catch { /* ignore */ }
-    }, timeoutMs);
-    const onOuterAbort = () => {
-        try { ac.abort(); } catch { /* ignore */ }
-    };
-    if (outerSignal) {
-        if (outerSignal.aborted) {
-            clearTimeout(timer);
-            throw new DOMException('aborted', 'AbortError');
-        }
-        outerSignal.addEventListener('abort', onOuterAbort, { once: true });
+    const tm = setTimeout(() => { timedOut = true; try { ac.abort(); } catch {} }, ms);
+    const onA = () => { try { ac.abort(); } catch {} };
+    if (outerSig) {
+        if (outerSig.aborted) { clearTimeout(tm); throw new DOMException('aborted', 'AbortError'); }
+        outerSig.addEventListener('abort', onA, { once: true });
     }
     try {
-        return await nativeFetch(url, { ...options, signal: ac.signal });
-    } catch (err) {
-        if (outerSignal?.aborted) throw new DOMException('aborted', 'AbortError');
-        if (timedOut) {
-            throw Object.assign(new Error(`请求超时 (${Math.round(timeoutMs / 1000)}s)`), { retryable: true });
-        }
-        throw Object.assign(err instanceof Error ? err : new Error(String(err)), { retryable: true });
+        return await nativeFetch(url, { ...opts, signal: ac.signal });
+    } catch (e) {
+        if (outerSig?.aborted) throw new DOMException('aborted', 'AbortError');
+        if (timedOut) throw Object.assign(new Error(`请求超时 (${Math.round(ms / 1000)}s)`), { retryable: true });
+        throw Object.assign(e instanceof Error ? e : new Error(String(e)), { retryable: true });
     } finally {
-        clearTimeout(timer);
-        outerSignal?.removeEventListener('abort', onOuterAbort);
+        clearTimeout(tm);
+        outerSig?.removeEventListener('abort', onA);
     }
 }
 
-/**
- * 时间预算抗断网重试：
- *   - 连续不可达期间按指数退避 + 抖动重试，最长持续 offlineGraceMinutes 分钟
- *   - 检测到浏览器离线时挂起等待 online / visibilitychange，不空烧重试
- *   - 遇到 4xx 非重试错误立即抛出；502/503/504/429/408 与网络断连自动重试
- */
-async function withResilientRetry(label, fn, outerSignal) {
+async function withRetry(label, fn, sig) {
     const graceMin = Math.max(1, Math.min(30, Number(getSettings().offlineGraceMinutes) || 10));
-    const retryDeadline = Date.now() + graceMin * 60 * 1000;
-    let attempt = 0;
-    let lastErr = null;
-
+    const deadline = Date.now() + graceMin * 60000;
+    let attempt = 0, lastErr = null;
     while (true) {
-        if (outerSignal?.aborted) throw new DOMException('aborted', 'AbortError');
-
-        // 明确离线时：先等待联网信号（每 5s 探一次防某些 WebView 的 navigator.onLine 滞后）
-        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-            if (Date.now() >= retryDeadline) break;
-            setStatusText(`${label}：检测到断网，等待恢复连接…`);
-            await smartSleep(5000, outerSignal, true);
+        if (sig?.aborted) throw new DOMException('aborted', 'AbortError');
+        if (navigator.onLine === false) {
+            if (Date.now() >= deadline) break;
+            setStatus(`${label}：检测到断网，等待恢复…`);
+            await smartSleep(5000, sig, true);
             continue;
         }
-
         attempt++;
         try {
             return await fn();
         } catch (err) {
-            if (outerSignal?.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
-                throw new DOMException('aborted', 'AbortError');
-            }
-            const status = err?.statusCode;
-            const retryable = Boolean(err?.retryable) || (status !== undefined && RETRYABLE_HTTP_STATUS.has(status));
-            if (!retryable) throw err;
-
+            if (sig?.aborted || (err instanceof DOMException && err.name === 'AbortError')) throw new DOMException('aborted', 'AbortError');
+            const st = err?.statusCode;
+            if (!err?.retryable && !(st !== undefined && RETRY_STATUS.has(st))) throw err;
             lastErr = err;
-            const remaining = retryDeadline - Date.now();
-            if (remaining <= 0) break;
-
-            const rawDelay = Math.min(RETRY_BASE_MS * (2 ** Math.min(attempt - 1, 4)), RETRY_MAX_DELAY_MS);
-            const jitter = rawDelay * (0.8 + Math.random() * 0.4);
-            const delay = Math.min(Math.round(jitter), remaining);
-            const remainSec = Math.ceil(remaining / 1000);
-
-            setStatusText(`${label}异常(${status || '网络断开'})，${(delay / 1000).toFixed(1)}s 后重试（剩余容忍 ${remainSec}s）`);
-            console.warn(`[st-tasks-relay] ${label} 第 ${attempt} 次重试 (${delay}ms):`, err.message);
-            await smartSleep(delay, outerSignal, true);
+            const rem = deadline - Date.now();
+            if (rem <= 0) break;
+            const raw = Math.min(RETRY_BASE_MS * (2 ** Math.min(attempt - 1, 4)), RETRY_MAX_MS);
+            const delay = Math.min(Math.round(raw * (0.8 + Math.random() * 0.4)), rem);
+            setStatus(`${label}异常(${st || '断网'})，${(delay / 1000).toFixed(1)}s 后重试（剩 ${Math.ceil(rem / 1000)}s）`);
+            await smartSleep(delay, sig, true);
         }
     }
-
-    throw Object.assign(
-        new Error(`${label}：断网超时（已容忍 ${graceMin} 分钟仍无法恢复，最后错误：${lastErr?.message ?? '网络断开'}）`),
-        { statusCode: 502 },
-    );
+    throw Object.assign(new Error(`${label}：断网超时（${graceMin} 分钟未恢复：${lastErr?.message ?? '网络断开'}）`), { statusCode: 502 });
 }
 
-// ==================== 任务 API 客户端 ====================
-
-async function submitTask(upstream, apiKey, body, outerSignal) {
-    const idempotencyKey = uuid();
-    return withResilientRetry('提交任务', async () => {
-        const resp = await fetchWithTimeout(
-            `${upstream}/v1/openai/tasks`,
-            {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${apiKey}`,
-                    'Content-Type': 'application/json',
-                    'X-Idempotency-Key': idempotencyKey,
-                },
-                body: JSON.stringify(body),
-            },
-            SUBMIT_TIMEOUT_MS,
-            outerSignal,
-        );
-        const text = await resp.text();
-        if (!resp.ok) {
-            throw Object.assign(
-                new Error(`任务提交失败 (${resp.status}): ${text.slice(0, 500)}`),
-                { statusCode: resp.status, retryable: RETRYABLE_HTTP_STATUS.has(resp.status) },
-            );
-        }
-        const data = JSON.parse(text);
-        if (!data?.id) throw new Error('任务提交未返回有效 task id');
-        return data.id;
-    }, outerSignal);
+async function submitTask(up, key, body, sig) {
+    const idem = uuid();
+    return withRetry('提交任务', async () => {
+        const r = await fetchTimeout(`${up}/v1/openai/tasks`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'X-Idempotency-Key': idem },
+            body: JSON.stringify(body),
+        }, SUBMIT_TIMEOUT_MS, sig);
+        const txt = await r.text();
+        if (!r.ok) throw Object.assign(new Error(`提交失败 (${r.status}): ${txt.slice(0, 400)}`), { statusCode: r.status, retryable: RETRY_STATUS.has(r.status) });
+        const d = JSON.parse(txt);
+        if (!d?.id) throw new Error('未返回 task id');
+        return d.id;
+    }, sig);
 }
 
-async function pollTaskOnce(upstream, apiKey, taskId, after, waitMs, outerSignal) {
+async function pollOnce(up, key, tid, after, waitMs, sig) {
     const qs = waitMs > 0 ? `?after=${after}&wait=${waitMs}` : `?after=${after}`;
-    const timeoutMs = (waitMs > 0 ? waitMs : 0) + POLL_HTTP_OVERHEAD_MS;
-
-    return withResilientRetry('拉取进度', async () => {
-        const started = Date.now();
-        const resp = await fetchWithTimeout(
-            `${upstream}/v1/openai/tasks/${encodeURIComponent(taskId)}${qs}`,
-            {
-                method: 'GET',
-                headers: { 'Authorization': `Bearer ${apiKey}` },
-            },
-            timeoutMs,
-            outerSignal,
-        );
-        if (!resp.ok) {
-            const text = await resp.text().catch(() => '');
-            throw Object.assign(
-                new Error(`任务查询失败 (${resp.status}): ${text.slice(0, 500)}`),
-                { statusCode: resp.status, retryable: RETRYABLE_HTTP_STATUS.has(resp.status) },
-            );
+    return withRetry('拉取进度', async () => {
+        const t0 = Date.now();
+        const r = await fetchTimeout(`${up}/v1/openai/tasks/${encodeURIComponent(tid)}${qs}`, {
+            method: 'GET',
+            headers: { Authorization: `Bearer ${key}` },
+        }, (waitMs > 0 ? waitMs : 0) + POLL_OVERHEAD_MS, sig);
+        if (!r.ok) {
+            const txt = await r.text().catch(() => '');
+            throw Object.assign(new Error(`查询失败 (${r.status}): ${txt.slice(0, 400)}`), { statusCode: r.status, retryable: RETRY_STATUS.has(r.status) });
         }
-        const env = await resp.json();
-        return { env, elapsedMs: Date.now() - started };
-    }, outerSignal);
+        return { env: await r.json(), elapsedMs: Date.now() - t0 };
+    }, sig);
 }
 
-async function cancelTask(upstream, apiKey, taskId) {
-    try {
-        await fetchWithTimeout(
-            `${upstream}/v1/openai/tasks/${encodeURIComponent(taskId)}/cancel`,
-            {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${apiKey}` },
-            },
-            10000,
-            null,
-        );
-    } catch (err) {
-        console.warn(`[st-tasks-relay] 取消任务 ${taskId} 失败:`, err.message);
-    }
+async function cancelTask(up, key, tid) {
+    try { await fetchTimeout(`${up}/v1/openai/tasks/${encodeURIComponent(tid)}/cancel`, { method: 'POST', headers: { Authorization: `Bearer ${key}` } }, 10000, null); } catch {}
 }
 
-// ==================== 请求体提取（黑名单透明透传） ====================
-
-function parseMaybeJsonObj(val) {
-    if (!val) return null;
-    if (typeof val === 'object' && !Array.isArray(val)) return val;
-    if (typeof val === 'string') {
-        try {
-            const parsed = JSON.parse(val);
-            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
-        } catch { /* ignore YAML/invalid */ }
-    }
-    return null;
-}
-
-function extractOpenAIBody(generateData) {
+function extractBody(gd) {
     const body = {};
-    for (const [k, v] of Object.entries(generateData)) {
-        if (v === undefined || ST_INTERNAL_FIELDS.has(k) || ST_VENDOR_PREFIX_RE.test(k)) continue;
+    for (const [k, v] of Object.entries(gd)) {
+        if (v === undefined || ST_INTERNAL.has(k) || VENDOR_RE.test(k)) continue;
         body[k] = v;
     }
-    body.stream = Boolean(generateData.stream);
-
-    // 尽量尊重 ST 的 custom_include_body / custom_exclude_body（JSON 格式时）
-    const inc = parseMaybeJsonObj(generateData.custom_include_body);
-    if (inc) Object.assign(body, inc);
-
-    if (Array.isArray(generateData.custom_exclude_body)) {
-        for (const k of generateData.custom_exclude_body) delete body[k];
-    } else if (typeof generateData.custom_exclude_body === 'string') {
-        for (const k of generateData.custom_exclude_body.split(/[\s,]+/).filter(Boolean)) {
-            delete body[k];
-        }
+    body.stream = Boolean(gd.stream);
+    if (gd.custom_include_body) {
+        try {
+            const inc = typeof gd.custom_include_body === 'string' ? JSON.parse(gd.custom_include_body) : gd.custom_include_body;
+            if (inc && typeof inc === 'object' && !Array.isArray(inc)) Object.assign(body, inc);
+        } catch {}
     }
+    if (Array.isArray(gd.custom_exclude_body)) for (const k of gd.custom_exclude_body) delete body[k];
+    else if (typeof gd.custom_exclude_body === 'string') for (const k of gd.custom_exclude_body.split(/[\s,]+/).filter(Boolean)) delete body[k];
     return body;
 }
 
-function shouldIntercept(generateData) {
-    const s = getSettings();
+function shouldIntercept(gd) {
+    const s = getSettings(), oai = getOai();
     if (!s.enabled) return false;
-    if (getOaiSettings().chat_completion_source !== chat_completion_sources.CUSTOM) return false;
-    if (!generateData || typeof generateData !== 'object' || !generateData.model) return false;
+    if (oai.chat_completion_source !== chat_completion_sources.CUSTOM) return false;
+    if (!gd || typeof gd !== 'object' || !gd.model) return false;
+    if (s.onlyMainChat !== false) {
+        if (quietActive) return false;
+        if (gd.chat_completion_source && gd.chat_completion_source !== chat_completion_sources.CUSTOM) return false;
+        const mainUrl = normUrl(oai.custom_url), reqUrl = normUrl(gd.custom_url);
+        if (mainUrl && reqUrl && reqUrl !== mainUrl) return false;
+        const mainModel = String(oai.custom_model_id || '').trim(), reqModel = String(gd.model || '').trim();
+        if (mainModel && reqModel && reqModel !== mainModel) return false;
+    }
     return true;
 }
 
-// ==================== 响应封装（流式 / 非流式） ====================
-
-function envelopeToResponse(env) {
-    const status = env.status === 'failed'
-        ? (env.status_code ?? 502)
-        : (env.status === 'cancelled' ? 499 : 200);
-    const body = env.status === 'completed'
-        ? JSON.stringify(env.result ?? {})
-        : JSON.stringify(env.result ?? { error: { message: env.error ?? `任务 ${env.status}`, code: status } });
-    return new Response(body, {
-        status,
-        headers: { 'Content-Type': 'application/json' },
-    });
+function envToResp(env) {
+    const st = env.status === 'failed' ? (env.status_code ?? 502) : (env.status === 'cancelled' ? 499 : 200);
+    const body = env.status === 'completed' ? JSON.stringify(env.result ?? {}) : JSON.stringify(env.result ?? { error: { message: env.error ?? `任务 ${env.status}`, code: st } });
+    return new Response(body, { status: st, headers: { 'Content-Type': 'application/json' } });
 }
 
-function streamTaskResponse(upstream, apiKey, taskId, signal) {
-    const encoder = new TextEncoder();
-    const useLongPoll = Boolean(getSettings().useLongPoll);
-    let cancelledByReader = false;
-    let cancelSent = false;
-    const cancelOnce = () => {
-        if (cancelSent) return;
-        cancelSent = true;
-        cancelTask(upstream, apiKey, taskId);
-    };
-
+function streamResp(up, key, tid, sig) {
+    const enc = new TextEncoder();
+    let cancelled = false, cancelSent = false;
+    const cancelOnce = () => { if (!cancelSent) { cancelSent = true; cancelTask(up, key, tid); } };
     const stream = new ReadableStream({
-        async start(controller) {
-            const deadline = Date.now() + POLL_MAX_MINUTES * 60 * 1000;
-            let after = 0;
-            let seenDone = false;
-            let seenError = false;
-            let serverSupportsLongPoll = useLongPoll;
-
+        async start(ctrl) {
+            const deadline = Date.now() + POLL_MAX_MIN * 60000;
+            let after = 0, seenDone = false, seenErr = false, lp = Boolean(getSettings().useLongPoll);
             try {
-                while (Date.now() < deadline) {
-                    if (signal?.aborted || cancelledByReader) break;
-
-                    const waitMs = serverSupportsLongPoll ? LONG_POLL_WAIT_MS : 0;
-                    const { env, elapsedMs } = await pollTaskOnce(upstream, apiKey, taskId, after, waitMs, signal);
-
-                    const chunks = Array.isArray(env.chunks) ? env.chunks : [];
-                    for (const chunk of chunks) {
-                        if (chunk.includes('[DONE]')) seenDone = true;
-                        if (chunk.includes('"error"')) seenError = true;
-                        controller.enqueue(encoder.encode(chunk));
+                while (Date.now() < deadline && !sig?.aborted && !cancelled) {
+                    const { env, elapsedMs } = await pollOnce(up, key, tid, after, lp ? LONG_POLL_WAIT_MS : 0, sig);
+                    const chs = Array.isArray(env.chunks) ? env.chunks : [];
+                    for (const c of chs) {
+                        if (c.includes('[DONE]')) seenDone = true;
+                        if (c.includes('"error"')) seenErr = true;
+                        ctrl.enqueue(enc.encode(c));
                     }
-                    after = env.next_after ?? (after + chunks.length);
-                    setStatusText(`接收中 ${taskId.slice(0, 12)}（已收 ${after} 片）`);
-
+                    after = env.next_after ?? (after + chs.length);
+                    setStatus(`接收中 ${tid.slice(0, 12)}（已收 ${after} 片）`);
                     if (env.done) {
-                        if (env.status === 'failed' && env.error && !seenError) {
-                            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: env.error, code: env.status_code ?? 502 } })}\n\n`));
-                            seenError = true;
-                        }
-                        if (env.status === 'cancelled' && !seenError) {
-                            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: '任务已取消', code: 499 } })}\n\n`));
-                            seenError = true;
-                        }
-                        if (!seenDone) {
-                            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-                        }
-                        setStatusText(`完成 ${taskId.slice(0, 12)}（${env.status}，共 ${after} 片）`);
+                        if (env.status === 'failed' && env.error && !seenErr) ctrl.enqueue(enc.encode(`data: ${JSON.stringify({ error: { message: env.error, code: env.status_code ?? 502 } })}\n\n`));
+                        if (env.status === 'cancelled' && !seenErr) ctrl.enqueue(enc.encode(`data: ${JSON.stringify({ error: { message: '任务已取消', code: 499 } })}\n\n`));
+                        if (!seenDone) ctrl.enqueue(enc.encode('data: [DONE]\n\n'));
+                        setStatus(`完成 ${tid.slice(0, 12)}（${env.status}，${after} 片）`);
                         break;
                     }
-
-                    // 自动识别旧版短轮询后端：请求带 wait=25000 却在 <300ms 内空返回，平滑降级间隔防空转
-                    if (serverSupportsLongPoll && chunks.length === 0 && elapsedMs < 300) {
-                        serverSupportsLongPoll = false;
-                        console.info('[st-tasks-relay] 检测到上游不支持长轮询，已自动平滑降级为智能间隔轮询');
-                    }
-
-                    if (!serverSupportsLongPoll) {
-                        const delay = chunks.length > 0 ? FALLBACK_BUSY_MS : FALLBACK_IDLE_MS;
-                        await smartSleep(delay, signal, true);
-                    }
+                    if (lp && !chs.length && elapsedMs < 300) lp = false;
+                    if (!lp) await smartSleep(chs.length ? FALLBACK_BUSY_MS : FALLBACK_IDLE_MS, sig, true);
                 }
-
-                if (Date.now() >= deadline && !signal?.aborted && !cancelledByReader) {
-                    await cancelTask(upstream, apiKey, taskId);
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: `任务 ${taskId} 超时 (${POLL_MAX_MINUTES} 分钟)`, code: 504 } })}\n\n`));
-                    controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-                    setStatusText(`超时取消 ${taskId.slice(0, 12)}`);
+                if (Date.now() >= deadline && !sig?.aborted && !cancelled) {
+                    await cancelTask(up, key, tid);
+                    ctrl.enqueue(enc.encode(`data: ${JSON.stringify({ error: { message: `任务超时 (${POLL_MAX_MIN} 分钟)`, code: 504 } })}\n\ndata: [DONE]\n\n`));
                 }
-            } catch (err) {
-                if (signal?.aborted || cancelledByReader || (err instanceof DOMException && err.name === 'AbortError')) {
-                    cancelOnce();
-                    setStatusText(`已取消 ${taskId.slice(0, 12)}`);
+            } catch (e) {
+                if (sig?.aborted || cancelled || (e instanceof DOMException && e.name === 'AbortError')) {
+                    cancelOnce(); setStatus(`已取消 ${tid.slice(0, 12)}`);
                 } else {
-                    setStatusText(`中断：${err.message}`);
-                    try {
-                        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: err.message ?? String(err), code: err.statusCode ?? 502 } })}\n\n`));
-                        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-                    } catch { /* controller closed */ }
+                    setStatus(`中断：${e.message}`);
+                    try { ctrl.enqueue(enc.encode(`data: ${JSON.stringify({ error: { message: e.message ?? String(e), code: e.statusCode ?? 502 } })}\n\ndata: [DONE]\n\n`)); } catch {}
                 }
-            } finally {
-                try { controller.close(); } catch { /* already closed */ }
-            }
+            } finally { try { ctrl.close(); } catch {} }
         },
-        cancel() {
-            cancelledByReader = true;
-            cancelOnce();
-        },
+        cancel() { cancelled = true; cancelOnce(); },
     });
-
-    return new Response(stream, {
-        status: 200,
-        headers: {
-            'Content-Type': 'text/event-stream; charset=utf-8',
-            'Cache-Control': 'no-cache',
-        },
-    });
+    return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache' } });
 }
 
-async function runTaskAsResponse(generateData, signal) {
-    const upstream = resolveUpstream();
-    const apiKey = resolveApiKey();
-    const requestBody = extractOpenAIBody(generateData);
-
-    setStatusText(`提交任务中 (${requestBody.model})…`);
-    const rawPreview = JSON.stringify(requestBody.messages || requestBody.prompt || '');
-    const isCtrlPacket = rawPreview.includes('[[PG_CACHE_CTRL:');
-    const taskId = await submitTask(upstream, apiKey, requestBody, signal);
-
-    // 仅普通生成任务落盘，防止 GG跳蛋缓存 3.2 的 probe/replay 控制包覆盖上次真实任务记录
-    if (!isCtrlPacket) {
-        saveLastTask({
-            taskId,
-            upstream,
-            model: requestBody.model,
-            stream: requestBody.stream,
-            createdAt: Date.now(),
-        });
-    }
-    setStatusText(isCtrlPacket ? `执行缓存控制指令 (${taskId.slice(0, 12)})…` : `已提交 ${taskId.slice(0, 12)}，等待服务端生成…`);
-    console.info(`[st-tasks-relay] 任务已提交: ${taskId} (stream=${requestBody.stream})`);
-
-    // 从此刻起任务已在服务端启动，任何后续异常都标记 submitted=true，外层绝不再回退原生直连
+async function runTask(gd, sig) {
+    const up = resolveUpstream(), key = resolveApiKey(), body = extractBody(gd);
+    const isCtrl = JSON.stringify(body.messages || body.prompt || '').includes('[[PG_CACHE_CTRL:');
+    setStatus(`提交中 (${body.model})…`);
+    const tid = await submitTask(up, key, body, sig);
+    if (!isCtrl) saveLastTask({ taskId: tid, upstream: up, model: body.model, stream: body.stream, createdAt: Date.now() });
+    setStatus(isCtrl ? `执行缓存指令 (${tid.slice(0, 12)})…` : `已提交 ${tid.slice(0, 12)}，等待生成…`);
     try {
-        if (!requestBody.stream) {
-            const deadline = Date.now() + POLL_MAX_MINUTES * 60 * 1000;
-            const useLongPoll = Boolean(getSettings().useLongPoll);
-            let serverSupportsLongPoll = useLongPoll;
-            let after = 0;
-
+        if (!body.stream) {
+            const deadline = Date.now() + POLL_MAX_MIN * 60000;
+            let lp = Boolean(getSettings().useLongPoll), after = 0;
             while (Date.now() < deadline) {
-                if (signal?.aborted) {
-                    cancelTask(upstream, apiKey, taskId);
-                    throw new DOMException('aborted', 'AbortError');
-                }
-                const waitMs = serverSupportsLongPoll ? LONG_POLL_WAIT_MS : 0;
-                const { env, elapsedMs } = await pollTaskOnce(upstream, apiKey, taskId, after, waitMs, signal);
+                if (sig?.aborted) { cancelTask(up, key, tid); throw new DOMException('aborted', 'AbortError'); }
+                const { env, elapsedMs } = await pollOnce(up, key, tid, after, lp ? LONG_POLL_WAIT_MS : 0, sig);
                 after = env.next_after ?? after;
-                if (env.done) {
-                    setStatusText(`完成 ${taskId.slice(0, 12)} (${env.status})`);
-                    return envelopeToResponse(env);
-                }
-                if (serverSupportsLongPoll && elapsedMs < 300) {
-                    serverSupportsLongPoll = false;
-                }
-                if (!serverSupportsLongPoll) {
-                    await smartSleep(FALLBACK_IDLE_MS, signal, true);
-                }
+                if (env.done) { setStatus(`完成 ${tid.slice(0, 12)} (${env.status})`); return envToResp(env); }
+                if (lp && elapsedMs < 300) lp = false;
+                if (!lp) await smartSleep(FALLBACK_IDLE_MS, sig, true);
             }
-            await cancelTask(upstream, apiKey, taskId);
-            throw Object.assign(new Error(`任务 ${taskId} 超过 ${POLL_MAX_MINUTES} 分钟未完成`), { statusCode: 504 });
+            await cancelTask(up, key, tid);
+            throw Object.assign(new Error(`任务超过 ${POLL_MAX_MIN} 分钟未完成`), { statusCode: 504 });
         }
-
-        return streamTaskResponse(upstream, apiKey, taskId, signal);
-    } catch (err) {
-        if (err instanceof DOMException && err.name === 'AbortError') {
-            cancelTask(upstream, apiKey, taskId);
-            throw err;
-        }
-        throw Object.assign(err instanceof Error ? err : new Error(String(err)), { taskSubmitted: true });
+        return streamResp(up, key, tid, sig);
+    } catch (e) {
+        if (e instanceof DOMException && e.name === 'AbortError') { cancelTask(up, key, tid); throw e; }
+        throw Object.assign(e instanceof Error ? e : new Error(String(e)), { taskSubmitted: true });
     }
 }
 
-// ==================== 无侵入式 fetch 拦截 ====================
-
-let patchInstalled = false;
-
-async function readRequestMeta(input, init) {
-    const url = typeof input === 'string' ? input : (input?.url ?? '');
-    const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
-    if (!url.includes(GENERATE_URL) || method !== 'POST') return null;
-
-    let rawBody = init?.body;
-    if (rawBody === undefined && input instanceof Request) {
-        rawBody = await input.clone().text();
-    }
-    if (typeof rawBody !== 'string') return null;
-    const signal = init?.signal ?? (input instanceof Request ? input.signal : null);
-    return { rawBody, signal };
-}
-
-function installFetchPatchOnce() {
-    if (patchInstalled) return;
-    patchInstalled = true;
-    const prevFetch = window.fetch;
-
+let patched = false;
+function installPatch() {
+    if (patched) return;
+    patched = true;
+    const prev = window.fetch;
     window.fetch = async function (input, init) {
-        // 动态检查开关：关闭时零开销直接透传，避免卸载 patch 破坏后装插件的 fetch 链
-        if (!getSettings().enabled) {
-            return prevFetch.call(this, input, init);
-        }
-        let meta = null;
-        try {
-            meta = await readRequestMeta(input, init);
-        } catch { /* ignore */ }
-
-        if (meta) {
-            let generateData = null;
-            try {
-                generateData = JSON.parse(meta.rawBody);
-            } catch { /* ignore non-JSON */ }
-
-            if (generateData && shouldIntercept(generateData)) {
-                try {
-                    return await runTaskAsResponse(generateData, meta.signal ?? null);
-                } catch (err) {
-                    if (err instanceof DOMException && err.name === 'AbortError') throw err;
-                    // 已成功提交到任务网关后绝不回退直连，防止重复扣费！直接返回错误响应给 ST
-                    if (err?.taskSubmitted) {
-                        const status = err.statusCode ?? 502;
-                        return new Response(
-                            JSON.stringify({ error: { message: err.message, code: status } }),
-                            { status, headers: { 'Content-Type': 'application/json' } },
-                        );
-                    }
-                    // 仅配置缺失等提交前错误才回退原生直连
-                    console.error('[st-tasks-relay] 接管前置校验失败，回退原生请求:', err);
-                    if (typeof toastr !== 'undefined') {
-                        toastr.warning(`任务网关接管失败：${err.message}`, '已回退直连模式');
+        if (!getSettings().enabled) return prev.call(this, input, init);
+        const url = typeof input === 'string' ? input : (input?.url ?? '');
+        const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+        if (url.includes(GENERATE_URL) && method === 'POST') {
+            let raw = init?.body;
+            if (raw === undefined && input instanceof Request) raw = await input.clone().text().catch(() => '');
+            if (typeof raw === 'string') {
+                let gd = null; try { gd = JSON.parse(raw); } catch {}
+                if (gd && shouldIntercept(gd)) {
+                    try {
+                        return await runTask(gd, init?.signal ?? (input instanceof Request ? input.signal : null));
+                    } catch (e) {
+                        if (e instanceof DOMException && e.name === 'AbortError') throw e;
+                        if (e?.taskSubmitted) return new Response(JSON.stringify({ error: { message: e.message, code: e.statusCode ?? 502 } }), { status: e.statusCode ?? 502, headers: { 'Content-Type': 'application/json' } });
+                        if (typeof toastr !== 'undefined') toastr.warning(`任务网关接管失败：${e.message}`, '已回退直连');
                     }
                 }
             }
         }
-        return prevFetch.call(this, input, init);
+        return prev.call(this, input, init);
     };
-    console.info('[st-tasks-relay] fetch 拦截器已就绪');
 }
 
-// ==================== 辅助功能：测试连接 & 找回上次回复 ====================
-
-function extractTextFromEnvelope(env) {
+function extractText(env) {
     if (!env.stream && env.result) {
-        const msg = env.result?.choices?.[0]?.message;
-        const reasoning = msg?.reasoning_content || msg?.reasoning || '';
-        const content = msg?.content || '';
-        return (reasoning ? `<think>\n${reasoning}\n</think>\n\n` : '') + content;
+        const m = env.result?.choices?.[0]?.message;
+        const r = m?.reasoning_content || m?.reasoning || '', c = m?.content || '';
+        return (r ? `<think>\n${r}\n</think>\n\n` : '') + c;
     }
-    let reasoning = '';
-    let content = '';
-    for (const chunk of (env.chunks || [])) {
-        for (const line of String(chunk).split('\n')) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data:')) continue;
-            const payload = trimmed.slice(5).trim();
-            if (!payload || payload === '[DONE]') continue;
-            try {
-                const obj = JSON.parse(payload);
-                const delta = obj?.choices?.[0]?.delta;
-                if (delta?.reasoning_content) reasoning += delta.reasoning_content;
-                else if (delta?.reasoning) reasoning += delta.reasoning;
-                if (delta?.content) content += delta.content;
-            } catch { /* ignore */ }
-        }
-    }
-    return (reasoning ? `<think>\n${reasoning}\n</think>\n\n` : '') + content;
-}
-
-async function testGatewayConnection() {
-    try {
-        const upstream = resolveUpstream();
-        const apiKey = resolveApiKey();
-        setStatusText('正在测试网关连接…');
-
-        let healthInfo = '';
+    let r = '', c = '';
+    for (const ch of (env.chunks || [])) for (const l of String(ch).split('\n')) {
+        const t = l.trim(); if (!t.startsWith('data:')) continue;
+        const p = t.slice(5).trim(); if (!p || p === '[DONE]') continue;
         try {
-            const hr = await fetchWithTimeout(`${upstream}/health`, { method: 'GET' }, 8000, null);
-            if (hr.ok) {
-                const h = await hr.json();
-                healthInfo = `运行中 ${h.running_tasks ?? 0} / 缓存 ${h.cached_tasks ?? 0}`;
-            }
-        } catch { /* 原版上游可能无 /health */ }
-
-        const mr = await fetchWithTimeout(
-            `${upstream}/v1/models`,
-            { headers: { 'Authorization': `Bearer ${apiKey}` } },
-            15000,
-            null,
-        );
-        if (!mr.ok) {
-            const t = await mr.text().catch(() => '');
-            throw new Error(`HTTP ${mr.status} ${t.slice(0, 200)}`);
-        }
-        const mdata = await mr.json();
-        const count = Array.isArray(mdata?.data) ? mdata.data.length : '?';
-        const msg = `连接正常（模型 ${count} 个${healthInfo ? `，${healthInfo}` : ''}）`;
-        setStatusText(msg);
-        toastr.success(msg, 'ST Tasks Relay');
-    } catch (err) {
-        setStatusText(`测试失败：${err.message}`);
-        toastr.error(err.message, 'ST Tasks Relay 连接失败');
+            const d = JSON.parse(p)?.choices?.[0]?.delta;
+            if (d?.reasoning_content) r += d.reasoning_content; else if (d?.reasoning) r += d.reasoning;
+            if (d?.content) c += d.content;
+        } catch {}
     }
+    return (r ? `<think>\n${r}\n</think>\n\n` : '') + c;
 }
 
-async function recoverLastTask() {
+async function testConn() {
+    try {
+        const up = resolveUpstream(), key = resolveApiKey();
+        setStatus('测试连接中…');
+        const mr = await fetchTimeout(`${up}/v1/models`, { headers: { Authorization: `Bearer ${key}` } }, 15000, null);
+        if (!mr.ok) throw new Error(`HTTP ${mr.status}`);
+        const d = await mr.json();
+        const msg = `连接正常（可用模型 ${Array.isArray(d?.data) ? d.data.length : '?'} 个）`;
+        setStatus(msg); toastr.success(msg, 'ST Tasks Relay');
+    } catch (e) { setStatus(`测试失败：${e.message}`); toastr.error(e.message, '连接失败'); }
+}
+
+async function recoverLast() {
     try {
         const last = loadLastTask();
-        if (!last?.taskId) {
-            toastr.info('本地暂无可找回的近期任务记录', 'ST Tasks Relay');
-            return;
-        }
-        const upstream = last.upstream || resolveUpstream();
-        const apiKey = resolveApiKey();
-        setStatusText(`正在从服务端找回 ${last.taskId.slice(0, 12)}…`);
-
-        const { env } = await pollTaskOnce(upstream, apiKey, last.taskId, 0, 0, null);
-        const text = extractTextFromEnvelope(env);
+        if (!last?.taskId) return toastr.info('本地暂无近期任务记录', 'ST Tasks Relay');
+        const up = last.upstream || resolveUpstream(), key = resolveApiKey();
+        setStatus(`正在找回 ${last.taskId.slice(0, 12)}…`);
+        const { env } = await pollOnce(up, key, last.taskId, 0, 0, null);
+        const text = extractText(env);
         if (!text) {
-            const tip = env.done
-                ? `任务状态为 ${env.status}${env.error ? `（${env.error}）` : ''}，未提取到正文`
-                : '任务仍在服务端生成中，请稍后再试';
-            setStatusText(tip);
-            toastr.warning(tip, 'ST Tasks Relay');
-            return;
+            const tip = env.done ? `状态 ${env.status}${env.error ? `（${env.error}）` : ''}，无正文` : '服务端仍在生成中，请稍后再试';
+            setStatus(tip); return toastr.warning(tip, 'ST Tasks Relay');
         }
-
-        let copied = false;
-        try {
-            await navigator.clipboard.writeText(text);
-            copied = true;
-        } catch { /* 某些 HTTP 页面无剪贴板权限 */ }
-
-        const statusTip = `已找回 ${text.length} 字（任务状态：${env.status}）${copied ? '，已复制到剪贴板' : ''}`;
-        setStatusText(statusTip);
-        toastr.success(statusTip, 'ST Tasks Relay');
-        if (!copied) {
-            window.prompt('剪贴板受限，请手动全选复制找回的正文：', text);
-        }
-    } catch (err) {
-        setStatusText(`找回失败：${err.message}`);
-        toastr.error(err.message, 'ST Tasks Relay 找回失败');
-    }
+        let copied = false; try { await navigator.clipboard.writeText(text); copied = true; } catch {}
+        const tip = `已找回 ${text.length} 字${copied ? '，已复制' : ''}`;
+        setStatus(tip); toastr.success(tip, 'ST Tasks Relay');
+        if (!copied) window.prompt('请全选复制找回的正文：', text);
+    } catch (e) { setStatus(`找回失败：${e.message}`); toastr.error(e.message, '找回失败'); }
 }
 
-// ==================== 设置面板绑定 ====================
-
-async function addSettingsPanel() {
+async function addPanel() {
     const html = await renderExtensionTemplateAsync(resolveTemplateBase(), 'settings', {});
     $('#extensions_settings2').append(html);
-
     const s = getSettings();
-
     $('#st_tasks_relay_enabled').prop('checked', s.enabled).on('change', function () {
-        s.enabled = $(this).prop('checked');
-        saveSettingsDebounced();
-        toastr.info(s.enabled ? '已开启断网续传任务接管' : '已关闭接管，恢复原生直连', 'ST Tasks Relay');
+        s.enabled = $(this).prop('checked'); saveSettingsDebounced();
+        toastr.info(s.enabled ? '已开启断网续传接管' : '已关闭接管，恢复原生直连', 'ST Tasks Relay');
     });
-
-    // API 密钥回显与切换可见
-    const keyInput = $('#st_tasks_relay_key');
-    keyInput.val(s.apiKey).toggleClass('has-key', Boolean(s.apiKey?.trim()));
-    keyInput.on('input', function () {
-        s.apiKey = String($(this).val());
-        $(this).toggleClass('has-key', Boolean(s.apiKey?.trim()));
-    });
+    const ki = $('#st_tasks_relay_key').val(s.apiKey).toggleClass('has-key', Boolean(s.apiKey?.trim()));
+    ki.on('input', function () { s.apiKey = String($(this).val()); $(this).toggleClass('has-key', Boolean(s.apiKey?.trim())); });
     $('#st_tasks_relay_key_toggle').on('click', function () {
-        const isPwd = keyInput.attr('type') === 'password';
-        keyInput.attr('type', isPwd ? 'text' : 'password');
+        ki.attr('type', ki.attr('type') === 'password' ? 'text' : 'password');
         $(this).toggleClass('fa-eye fa-eye-slash');
     });
+    const ui = $('#st_tasks_relay_upstream').val(s.upstreamOverride || '');
+    $('#st_tasks_relay_only_main').prop('checked', s.onlyMainChat !== false).on('change', function () { s.onlyMainChat = $(this).prop('checked'); saveSettingsDebounced(); });
+    $('#st_tasks_relay_longpoll').prop('checked', Boolean(s.useLongPoll)).on('change', function () { s.useLongPoll = $(this).prop('checked'); saveSettingsDebounced(); });
+    $('#st_tasks_relay_grace_min').val(s.offlineGraceMinutes ?? 10).on('change', function () { s.offlineGraceMinutes = Math.max(1, Math.min(30, Number($(this).val()) || 10)); $(this).val(s.offlineGraceMinutes); saveSettingsDebounced(); });
 
-    // 修复原版 Bug：回显已保存的上游网关地址！
-    const upstreamInput = $('#st_tasks_relay_upstream');
-    upstreamInput.val(s.upstreamOverride || '');
-
-    // 高级选项回显与绑定
-    $('#st_tasks_relay_longpoll').prop('checked', Boolean(s.useLongPoll)).on('change', function () {
-        s.useLongPoll = $(this).prop('checked');
-        saveSettingsDebounced();
+    const bindSave = (sel, fn) => $(sel).on('click', async function () {
+        await fn(); await saveSettings();
+        const ic = $(this); ic.addClass('fa-check').removeClass('fa-save');
+        setTimeout(() => ic.addClass('fa-save').removeClass('fa-check'), 1500);
     });
-    $('#st_tasks_relay_grace_min').val(s.offlineGraceMinutes ?? 10).on('change', function () {
-        s.offlineGraceMinutes = Math.max(1, Math.min(30, Number($(this).val()) || 10));
-        $(this).val(s.offlineGraceMinutes);
-        saveSettingsDebounced();
-    });
-
-    function bindSaveIcon(selector, onSave) {
-        $(selector).on('click', async function () {
-            await onSave();
-            await saveSettings();
-            const icon = $(this);
-            icon.addClass('fa-check').removeClass('fa-save');
-            setTimeout(() => icon.addClass('fa-save').removeClass('fa-check'), 1500);
-        });
-    }
-
-    bindSaveIcon('#st_tasks_relay_key_save', async () => {
-        s.apiKey = String(keyInput.val()).trim();
-        keyInput.val(s.apiKey).toggleClass('has-key', Boolean(s.apiKey));
-        toastr.success('API 密钥已保存', 'ST Tasks Relay');
-    });
-
-    bindSaveIcon('#st_tasks_relay_upstream_save', async () => {
-        s.upstreamOverride = String(upstreamInput.val()).trim();
-        upstreamInput.val(s.upstreamOverride);
-        toastr.success('任务网关地址已保存', 'ST Tasks Relay');
-    });
-
-    $('#st_tasks_relay_test').on('click', () => testGatewayConnection());
-    $('#st_tasks_relay_recover').on('click', () => recoverLastTask());
-
+    bindSave('#st_tasks_relay_key_save', () => { s.apiKey = String(ki.val()).trim(); ki.val(s.apiKey).toggleClass('has-key', Boolean(s.apiKey)); toastr.success('API 密钥已保存', 'ST Tasks Relay'); });
+    bindSave('#st_tasks_relay_upstream_save', () => { s.upstreamOverride = String(ui.val()).trim(); ui.val(s.upstreamOverride); toastr.success('网关地址已保存', 'ST Tasks Relay'); });
+    $('#st_tasks_relay_test').on('click', testConn);
+    $('#st_tasks_relay_recover').on('click', recoverLast);
     const last = loadLastTask();
-    if (last?.taskId) {
-        const ago = Math.max(0, Math.round((Date.now() - last.createdAt) / 60000));
-        setStatusText(`上次任务：${last.taskId.slice(0, 12)}（${last.model}，${ago} 分钟前）`);
-    }
+    if (last?.taskId) setStatus(`上次任务：${last.taskId.slice(0, 12)}（${last.model}）`);
 }
 
 export async function init() {
     loadSettings();
-    installFetchPatchOnce();
-    await addSettingsPanel();
-    console.info('[st-tasks-relay] v2.0.0 已加载');
+    bindGenEvents();
+    installPatch();
+    await addPanel();
 }
