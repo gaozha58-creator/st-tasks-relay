@@ -41,8 +41,12 @@
                 </div>
 
                 <details class="flex-basis100">
-                    <summary style="cursor:pointer;opacity:.8">高级选项（长轮询 / 断网容忍时间）</summary>
+                    <summary style="cursor:pointer;opacity:.8">高级选项（主请求过滤 / 长轮询 / 断网容忍）</summary>
                     <div class="flex-container flexFlowColumn" style="margin-top:8px;gap:6px">
+                        <label class="checkbox_label">
+                            <input id="st_tasks_relay_only_main" type="checkbox">
+                            <span>仅接管主聊天请求（跳过记忆/总结等后台插件）</span>
+                        </label>
                         <label class="checkbox_label">
                             <input id="st_tasks_relay_longpoll" type="checkbox">
                             <span>启用长轮询（自建网关 0ms 秒推；兼容旧服务端自动降级）</span>
@@ -55,7 +59,7 @@
                 </details>
 
                 <span class="flex-basis100 relay-hint">
-                    开启标题栏「接管」后，Custom 源生成改为「幂等提交 + 长轮询断点续传」，手机切后台/断网自动续拉；关闭「接管」立即恢复原生直连。
+                    默认仅接管主聊天请求，不干扰记忆/总结等外部插件；关闭标题栏「接管」立即恢复原生直连。
                 </span>
             </div>
         </div>
